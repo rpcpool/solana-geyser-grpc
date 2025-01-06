@@ -5998,7 +5998,7 @@ dependencies = [
 
 [[package]]
 name = "yellowstone-grpc-geyser"
-version = "4.2.2"
+version = "4.3.0"
 dependencies = [
  "affinity",
  "agave-geyser-plugin-interface",
@@ -6029,7 +6029,6 @@ dependencies = [
  "spl-token-2022 6.0.0",
  "thiserror",
  "tokio",
- "tokio-stream",
  "tonic",
  "tonic-health",
  "vergen",
@@ -6038,7 +6037,7 @@ dependencies = [
 
 [[package]]
 name = "yellowstone-grpc-proto"
-version = "4.1.1"
+version = "4.2.0"
 dependencies = [
  "agave-geyser-plugin-interface",
  "anyhow",

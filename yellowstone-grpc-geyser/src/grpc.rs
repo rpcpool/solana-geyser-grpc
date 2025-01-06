@@ -1,10 +1,11 @@
 use {
     crate::{
         config::{ConfigGrpc, ConfigTokio},
-        metrics::{self, DebugClientMessage},
+        metrics::{self, ConnectionCloseStatus, DebugClientMessage},
         version::GrpcVersionInfo,
     },
-    anyhow::Context,
+    anyhow::Context as _,
+    futures::stream::Stream,
     log::{error, info},
     prost_types::Timestamp,
     solana_sdk::{
@@ -13,10 +14,12 @@ use {
     },
     std::{
         collections::{BTreeMap, HashMap},
+        pin::Pin,
         sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,
         },
+        task::{Context, Poll},
         time::SystemTime,
     },
     tokio::{
@@ -26,7 +29,6 @@ use {
         task::spawn_blocking,
         time::{sleep, Duration, Instant},
     },
-    tokio_stream::wrappers::ReceiverStream,
     tonic::{
         service::interceptor::interceptor,
         transport::{
@@ -344,6 +346,7 @@ pub struct GrpcService {
     snapshot_rx: Mutex<Option<crossbeam_channel::Receiver<Box<Message>>>>,
     broadcast_tx: broadcast::Sender<BroadcastedMessage>,
     replay_stored_slots_tx: Option<mpsc::Sender<ReplayStoredSlotsRequest>>,
+    metric_connection_slot_lag: bool,
     debug_clients_tx: Option<mpsc::UnboundedSender<DebugClientMessage>>,
     filter_names: Arc<Mutex<FilterNames>>,
 }
@@ -353,6 +356,7 @@ impl GrpcService {
     pub async fn create(
         config_tokio: ConfigTokio,
         config: ConfigGrpc,
+        metric_connection_slot_lag: bool,
         debug_clients_tx: Option<mpsc::UnboundedSender<DebugClientMessage>>,
         is_reload: bool,
     ) -> anyhow::Result<(
@@ -442,6 +446,7 @@ impl GrpcService {
             snapshot_rx: Mutex::new(snapshot_rx),
             broadcast_tx: broadcast_tx.clone(),
             replay_stored_slots_tx,
+            metric_connection_slot_lag,
             debug_clients_tx,
             filter_names,
         })
@@ -896,6 +901,7 @@ impl GrpcService {
                                 if let Some(msg) = filter_new.get_pong_msg() {
                                     if stream_tx.send(Ok(msg)).await.is_err() {
                                         error!("client #{id}: stream closed");
+                                        metrics::connections_close_status_inc(ConnectionCloseStatus::TxClosed);
                                         break 'outer;
                                     }
                                     continue;
@@ -912,6 +918,7 @@ impl GrpcService {
                                         tokio::spawn(async move {
                                             let _ = stream_tx.send(Err(Status::internal("from_slot is not supported"))).await;
                                         });
+                                        metrics::connections_close_status_inc(ConnectionCloseStatus::FromSlot);
                                         break 'outer;
                                     };
 
@@ -922,6 +929,7 @@ impl GrpcService {
                                         tokio::spawn(async move {
                                             let _ = stream_tx.send(Err(Status::internal("failed to send from_slot request"))).await;
                                         });
+                                        metrics::connections_close_status_inc(ConnectionCloseStatus::FromSlot);
                                         break 'outer;
                                     }
 
@@ -935,6 +943,7 @@ impl GrpcService {
                                                 );
                                                 let _ = stream_tx.send(Err(Status::internal(message))).await;
                                             });
+                                            metrics::connections_close_status_inc(ConnectionCloseStatus::FromSlot);
                                             break 'outer;
                                         },
                                         Err(_error) => {
@@ -942,6 +951,7 @@ impl GrpcService {
                                             tokio::spawn(async move {
                                                 let _ = stream_tx.send(Err(Status::internal("failed to get replay response"))).await;
                                             });
+                                            metrics::connections_close_status_inc(ConnectionCloseStatus::FromSlot);
                                             break 'outer;
                                         }
                                     };
@@ -953,6 +963,7 @@ impl GrpcService {
                                                 Ok(()) => {}
                                                 Err(mpsc::error::SendError(_)) => {
                                                     error!("client #{id}: stream closed");
+                                                    metrics::connections_close_status_inc(ConnectionCloseStatus::TxClosed);
                                                     break 'outer;
                                                 }
                                             }
@@ -961,9 +972,11 @@ impl GrpcService {
                                 }
                             }
                             Some(None) => {
+                                metrics::connections_close_status_inc(ConnectionCloseStatus::RxClosed);
                                 break 'outer;
                             },
                             None => {
+                                metrics::connections_close_status_inc(ConnectionCloseStatus::RxClosed);
                                 break 'outer;
                             }
                         }
@@ -972,6 +985,7 @@ impl GrpcService {
                         let (commitment, messages) = match message {
                             Ok((commitment, messages)) => (commitment, messages),
                             Err(broadcast::error::RecvError::Closed) => {
+                                metrics::connections_close_status_inc(ConnectionCloseStatus::Internal);
                                 break 'outer;
                             },
                             Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -979,6 +993,7 @@ impl GrpcService {
                                 tokio::spawn(async move {
                                     let _ = stream_tx.send(Err(Status::internal("lagged to receive geyser messages"))).await;
                                 });
+                                metrics::connections_close_status_inc(ConnectionCloseStatus::Lagged);
                                 break 'outer;
                             }
                         };
@@ -993,10 +1008,12 @@ impl GrpcService {
                                             tokio::spawn(async move {
                                                 let _ = stream_tx.send(Err(Status::internal("lagged to send an update"))).await;
                                             });
+                                            metrics::connections_close_status_inc(ConnectionCloseStatus::Lagged);
                                             break 'outer;
                                         }
                                         Err(mpsc::error::TrySendError::Closed(_)) => {
                                             error!("client #{id}: stream closed");
+                                            metrics::connections_close_status_inc(ConnectionCloseStatus::TxClosed);
                                             break 'outer;
                                         }
                                     }
@@ -1089,7 +1106,7 @@ impl GrpcService {
 
 #[tonic::async_trait]
 impl Geyser for GrpcService {
-    type SubscribeStream = ReceiverStream<TonicResult<FilteredUpdate>>;
+    type SubscribeStream = ReceiverStream;
 
     async fn subscribe(
         &self,
@@ -1206,7 +1223,10 @@ impl Geyser for GrpcService {
             },
         ));
 
-        Ok(Response::new(ReceiverStream::new(stream_rx)))
+        Ok(Response::new(ReceiverStream::new(
+            stream_rx,
+            self.metric_connection_slot_lag,
+        )))
     }
 
     async fn ping(&self, request: Request<PingRequest>) -> Result<Response<PongResponse>, Status> {
@@ -1295,5 +1315,46 @@ impl Geyser for GrpcService {
         Ok(Response::new(GetVersionResponse {
             version: serde_json::to_string(&GrpcVersionInfo::default()).unwrap(),
         }))
+    }
+}
+
+#[derive(Debug)]
+pub struct ReceiverStream {
+    rx: mpsc::Receiver<TonicResult<FilteredUpdate>>,
+    metric_connection_slot_lag: bool,
+    max_slot: Slot,
+}
+
+impl ReceiverStream {
+    const fn new(
+        rx: mpsc::Receiver<TonicResult<FilteredUpdate>>,
+        metric_connection_slot_lag: bool,
+    ) -> Self {
+        Self {
+            rx,
+            metric_connection_slot_lag,
+            max_slot: 0,
+        }
+    }
+}
+
+impl Stream for ReceiverStream {
+    type Item = TonicResult<FilteredUpdate>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let value = futures::ready!(self.rx.poll_recv(cx));
+        if self.metric_connection_slot_lag {
+            if let Some(slot) = value
+                .as_ref()
+                .and_then(|item| item.as_ref().map(|item| item.message.get_slot()).ok())
+                .flatten()
+            {
+                if slot > self.max_slot {
+                    self.max_slot = slot;
+                    metrics::connections_slot_lag_observe(slot);
+                }
+            }
+        }
+        Poll::Ready(value)
     }
 }

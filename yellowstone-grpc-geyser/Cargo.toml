@@ -1,6 +1,6 @@
 [package]
 name = "yellowstone-grpc-geyser"
-version = "4.2.2"
+version = "4.3.0"
 authors = { workspace = true }
 edition = { workspace = true }
 description = "Yellowstone gRPC Geyser Plugin"
@@ -44,7 +44,6 @@ solana-transaction-status = { workspace = true }
 spl-token-2022 = { workspace = true, features = ["no-entrypoint"] }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs"] }
-tokio-stream = { workspace = true }
 tonic = { workspace = true, features = ["gzip", "zstd", "tls", "tls-roots"] }
 tonic-health = { workspace = true }
 yellowstone-grpc-proto = { workspace = true, features = ["convert", "plugin"] }
